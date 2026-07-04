@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+config COMP_MP3_DECODER
+    bool "MP3 DECODER component"
+    default y
+    help
+        Component that decodes compressed mp3 stream into PCM samples
+
