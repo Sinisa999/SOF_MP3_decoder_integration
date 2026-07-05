@@ -110,6 +110,8 @@ static int mp3_decoder_prepare(struct processing_module *mod, struct sof_source 
     struct comp_dev *dev = mod->dev;
     struct comp_buffer *sourceb;
     struct comp_buffer *sinkb;
+    uint32_t source_period_bytes;
+	uint32_t sink_period_bytes;
 
     comp_dbg(dev, "mp3_decoder_prepare");
 
@@ -121,12 +123,22 @@ static int mp3_decoder_prepare(struct processing_module *mod, struct sof_source 
         return -ENOTCONN;
     }
 
-    mod->priv.mpd.in_buff_size = MP3_INPUT_FILL_TARGET;
+    //mod->priv.mpd.in_buff_size = MP3_INPUT_FILL_TARGET;
 
     /* U najgorem slucaju jedan dekodovani odbirak jednog MP3 frejma:
         1152 PCM frejmova * 2 kanala * 2 bajta = 4608 bajtova
     */
-    mod->priv.mpd.out_buff_size = MP3_MAX_PCM_FRAMES * 2 * sizeof(drmp3_int16);
+    //mod->priv.mpd.out_buff_size = MP3_MAX_PCM_FRAMES * 2 * sizeof(drmp3_int16);
+
+    source_period_bytes = audio_stream_period_bytes(&sourceb->stream, dev->frames);
+	sink_period_bytes = audio_stream_period_bytes(&sinkb->stream, dev->frames);
+
+    mod->priv.mpd.in_buff_size = source_period_bytes;
+	mod->priv.mpd.out_buff_size = sink_period_bytes;
+
+    comp_info(dev,
+		"mp3_decoder_prepare: source_period_bytes=%d sink_period_bytes=%d dev_frames=%d",
+		source_period_bytes, sink_period_bytes, dev->frames);
 
     return 0;
 }
@@ -174,16 +186,17 @@ static uint32_t mp3_decoder_fill_input_buffer(struct audio_stream *source,
         return 0;
     }
 
+    src = audio_stream_get_rptr(source);
+
     while (source_bytes_available > 0 && 
             md->input_bytes_available < MP3_INPUT_FILL_TARGET &&
             md->input_bytes_available < MP3_INPUT_BUFFER_SIZE)
         {
-            src = audio_stream_get_rptr(source);
 
             md->input_buffer[md->input_bytes_available] = *src;
 
             src = audio_stream_wrap(source, src + 1);
-            audio_stream_set_rptr(source, src);
+            
 
             md->input_bytes_available++;
             copied++;
@@ -209,6 +222,8 @@ static uint32_t mp3_decoder_write_pending_pcm(struct audio_stream *sink,
 	if (!sink || !md)
 		return 0;
 
+    dst = audio_stream_get_wptr(sink);
+
 	while (sink_frames_available > 0 &&
 	       md->pending_pcm_frame_offset < md->pending_pcm_frames) {
 		frame_index = md->pending_pcm_frame_offset;
@@ -221,14 +236,11 @@ static uint32_t mp3_decoder_write_pending_pcm(struct audio_stream *sink,
 			right = md->pcm_buffer[frame_index * md->pending_pcm_channels + 1];
 		}
 
-		dst = audio_stream_get_wptr(sink);
 		*dst = left;
 		dst = audio_stream_wrap(sink, dst + 1);
 
 		*dst = right;
 		dst = audio_stream_wrap(sink, dst + 1);
-
-		audio_stream_set_wptr(sink, dst);
 
 		md->pending_pcm_frame_offset++;
 		frames_written++;
@@ -239,6 +251,34 @@ static uint32_t mp3_decoder_write_pending_pcm(struct audio_stream *sink,
 		md->pending_pcm_frames = 0;
 		md->pending_pcm_frame_offset = 0;
 		md->pending_pcm_channels = 0;
+	}
+
+	return frames_written;
+}
+
+/* Temp pomocna funckija koja nam pomazaze za pokretanje sa testbenchom da bi mu pruzali neki output dok
+    modul akumulira dovoljno podataka */
+static uint32_t mp3_decoder_write_silence(struct audio_stream *sink,
+					  uint32_t sink_frames_available)
+{
+	int16_t *dst;
+	uint32_t frames_written = 0;
+
+	if (!sink)
+		return 0;
+
+	dst = audio_stream_get_wptr(sink);
+
+	while (sink_frames_available > 0) {
+		/* stereo silence */
+		*dst = 0;
+		dst = audio_stream_wrap(sink, dst + 1);
+
+		*dst = 0;
+		dst = audio_stream_wrap(sink, dst + 1);
+
+		frames_written++;
+		sink_frames_available--;
 	}
 
 	return frames_written;
@@ -306,7 +346,15 @@ static int mp3_decoder_process(struct processing_module *mod,
 		return -EINVAL;
 	}
 
-	sink_frames_available = output_buffers[0].size;
+	//sink_frames_available = output_buffers[0].size;
+    sink_frames_available = input_buffers[0].size;
+
+    comp_info(mod->dev,
+	  "mp3 sizes: input_size=%d output_size=%d source_bytes=%d sink_frames=%d",
+	  input_buffers[0].size,
+	  output_buffers[0].size,
+	  source_bytes_available,
+	  sink_frames_available);
 
 
      /* Ako smo vec dekodovali MP3 frejm ranije ali nismo sve upisali u bafer, preuzeti ostatak prvo */
@@ -314,6 +362,14 @@ static int mp3_decoder_process(struct processing_module *mod,
 	if (md->pending_pcm_frames > 0) {
 		written_frames = mp3_decoder_write_pending_pcm(sink, md,
 							       sink_frames_available);
+
+        
+        comp_info(mod->dev,
+            "mp3 pcm write: written_frames=%d pending_frames=%d pending_offset=%d",
+            written_frames,
+            md->pending_pcm_frames,
+            md->pending_pcm_frame_offset);  
+
 
 		if (written_frames > 0)
 			audio_stream_produce(sink, written_frames * sink_channels * sizeof(int16_t));
@@ -328,14 +384,38 @@ static int mp3_decoder_process(struct processing_module *mod,
 	copied_bytes = mp3_decoder_fill_input_buffer(source, md,
 						     source_bytes_available);
 
+    comp_info(mod->dev,
+	  "mp3 fill: source_bytes=%d copied=%d input_avail=%d",
+	  source_bytes_available, copied_bytes, md->input_bytes_available);
+
 	if (copied_bytes > 0)
 		audio_stream_consume(source, copied_bytes);
 
 
     /* Potrebna bar 4 bajta za MP3 frejm header */
 
-	if (md->input_bytes_available < 4)
-		return 0;
+	if (md->input_bytes_available < MP3_INPUT_FILL_TARGET) {
+
+        comp_info(mod->dev,
+		  "mp3 buffering: input_avail=%d target=%d sink_frames_available=%d sink_channels=%d",
+		  md->input_bytes_available,
+		  MP3_INPUT_FILL_TARGET,
+		  sink_frames_available,
+		  sink_channels);
+
+	    written_frames = mp3_decoder_write_silence(sink, sink_frames_available);
+
+
+        comp_info(mod->dev,
+            "mp3 silence: written_frames=%d produced_bytes=%d",
+            written_frames,
+            written_frames * sink_channels * sizeof(int16_t));
+
+	if (written_frames > 0)
+		audio_stream_produce(sink, written_frames * sink_channels * sizeof(int16_t));
+
+	return 0;   
+    }
 
 	memset(&md->info, 0, sizeof(md->info));
 
@@ -348,13 +428,22 @@ static int mp3_decoder_process(struct processing_module *mod,
 					       md->pcm_buffer,
 					       &md->info);
 
-	comp_dbg(mod->dev,
+
+    comp_info(mod->dev,
+	  "mp3 decode: avail=%d decoded=%d frame_bytes=%d ch=%d sr=%d",
+	  md->input_bytes_available,
+	  decoded_frames,
+	  md->info.frame_bytes,
+	  md->info.channels,
+	  md->info.sample_rate);
+
+	/*comp_dbg(mod->dev,
 		 "mp3 decode: avail=%d decoded=%d frame_bytes=%d ch=%d sr=%d",
 		 md->input_bytes_available,
 		 decoded_frames,
 		 md->info.frame_bytes,
 		 md->info.channels,
-		 md->info.sample_rate);
+		 md->info.sample_rate);*/
 
 
     /*
@@ -364,11 +453,13 @@ static int mp3_decoder_process(struct processing_module *mod,
     */
 
 	if (decoded_frames <= 0) {
-		if (md->info.frame_bytes > 0) {
-			mp3_decoder_consume_input_bytes(md, md->info.frame_bytes);
-		} else if (md->input_bytes_available >= MP3_INPUT_FILL_TARGET) {
-			mp3_decoder_consume_input_bytes(md, 1);
-		}
+        if (md->input_bytes_available >= MP3_INPUT_FILL_TARGET)
+            mp3_decoder_consume_input_bytes(md, 1);
+
+        written_frames = mp3_decoder_write_silence(sink, sink_frames_available);
+
+        if (written_frames > 0)
+		    audio_stream_produce(sink, written_frames * sink_channels * sizeof(int16_t));
 
 		return 0;
 	}
@@ -401,6 +492,14 @@ static int mp3_decoder_process(struct processing_module *mod,
 	written_frames = mp3_decoder_write_pending_pcm(sink, md,
 						       sink_frames_available);
 
+    
+    comp_info(mod->dev,
+        "mp3 pcm write: written_frames=%d pending_frames=%d pending_offset=%d",
+        written_frames,
+        md->pending_pcm_frames,
+        md->pending_pcm_frame_offset);
+
+
 	if (written_frames > 0)
 		audio_stream_produce(sink, written_frames * sink_channels * sizeof(int16_t));
 
@@ -429,6 +528,10 @@ static int mp3_decoder_reset(struct processing_module *mod)
     md->input_bytes_available = 0;
     md->sample_rate = 0;
     md->channels = 0;
+
+    md->pending_pcm_frames = 0;
+    md->pending_pcm_frame_offset = 0;
+    md->pending_pcm_channels = 0;
 
     comp_dbg(mod->dev, "mp3_decoder_reset");
 
@@ -473,6 +576,7 @@ UT_STATIC void sys_comp_module_mp3_decoder_interface_init(void);
 
 DECLARE_MODULE_ADAPTER(mp3_decoder_interface, mp3_decoder_uuid, mp3_decoder_tr);
 SOF_MODULE_INIT(mp3_decoder, sys_comp_module_mp3_decoder_interface_init);
+
 
 
 
